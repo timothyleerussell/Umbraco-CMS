@@ -250,22 +250,24 @@ namespace Umbraco.Web.Editors
 
             //initialize this to successful
             var publishStatus = Attempt<PublishStatus>.Succeed();
+            var wasCancelled = false;            
 
             if (contentItem.Action == ContentSaveAction.Save || contentItem.Action == ContentSaveAction.SaveNew)
             {
                 //save the item
-                Services.ContentService.Save(contentItem.PersistedContent, Security.CurrentUser.Id);
+                var saveResult = Services.ContentService.SaveWithStatus(contentItem.PersistedContent, Security.CurrentUser.Id);
+                wasCancelled = saveResult.Success == false && saveResult.Result.StatusType == OperationStatusType.FailedCancelledByEvent;
             }
             else if (contentItem.Action == ContentSaveAction.SendPublish || contentItem.Action == ContentSaveAction.SendPublishNew)
             {
-                Services.ContentService.SendToPublication(contentItem.PersistedContent, Security.CurrentUser.Id);
+                var sendResult = Services.ContentService.SendToPublication(contentItem.PersistedContent, Security.CurrentUser.Id);
+                wasCancelled = sendResult == false;
             }
             else
             {
                 //publish the item and check if it worked, if not we will show a diff msg below
                 publishStatus = Services.ContentService.SaveAndPublishWithStatus(contentItem.PersistedContent, Security.CurrentUser.Id);
             }
-            
 
             //return the updated model
             var display = Mapper.Map<IContent, ContentItemDisplay>(contentItem.PersistedContent);
@@ -278,11 +280,29 @@ namespace Umbraco.Web.Editors
             {
                 case ContentSaveAction.Save:
                 case ContentSaveAction.SaveNew:
-                    display.AddSuccessNotification(ui.Text("speechBubbles", "editContentSavedHeader"), ui.Text("speechBubbles", "editContentSavedText"));
+                    if (wasCancelled == false)
+                    {
+                        display.AddSuccessNotification(
+                            Services.TextService.Localize("speechBubbles/editContentSavedHeader"), 
+                            Services.TextService.Localize("speechBubbles/editContentSavedText"));
+                    }
+                    else
+                    {
+                        AddCancelMessage(display);
+                    }
                     break;
                 case ContentSaveAction.SendPublish:
                 case ContentSaveAction.SendPublishNew:
-                    display.AddSuccessNotification(ui.Text("speechBubbles", "editContentSendToPublish"), ui.Text("speechBubbles", "editContentSendToPublishText"));
+                    if (wasCancelled == false)
+                    {
+                        display.AddSuccessNotification(
+                            Services.TextService.Localize("speechBubbles/editContentSendToPublish"), 
+                            Services.TextService.Localize("speechBubbles/editContentSendToPublishText"));
+                    }
+                    else
+                    {
+                        AddCancelMessage(display);
+                    }
                     break;
                 case ContentSaveAction.Publish:
                 case ContentSaveAction.PublishNew:
@@ -295,57 +315,7 @@ namespace Umbraco.Web.Editors
             return display;
         }
 
-        /// <summary>
-        /// Checks if the user is currently in preview mode and if so will update the preview content for this item
-        /// </summary>
-        /// <param name="contentId"></param>
-        private void UpdatePreviewContext(int contentId)
-        {
-            var previewId = Request.GetPreviewCookieValue();
-            if (previewId.IsNullOrWhiteSpace()) return;
-            Guid id;
-            if (Guid.TryParse(previewId, out id))
-            {
-                var d = new Document(contentId);
-                var pc = new PreviewContent(UmbracoUser, id, false);
-                pc.PrepareDocument(UmbracoUser, d, true);
-                pc.SavePreviewSet();
-            }          
-        }
-
-        /// <summary>
-        /// Maps the dto property values to the persisted model
-        /// </summary>
-        /// <param name="contentItem"></param>
-        private void MapPropertyValues(ContentItemSave contentItem)
-        {
-            UpdateName(contentItem);
-
-            //TODO: We need to support 'send to publish'
-
-            contentItem.PersistedContent.ExpireDate = contentItem.ExpireDate;
-            contentItem.PersistedContent.ReleaseDate = contentItem.ReleaseDate;
-            //only set the template if it didn't change
-            var templateChanged = (contentItem.PersistedContent.Template == null && contentItem.TemplateAlias.IsNullOrWhiteSpace() == false)
-                                  || (contentItem.PersistedContent.Template != null && contentItem.PersistedContent.Template.Alias != contentItem.TemplateAlias)
-                                  || (contentItem.PersistedContent.Template != null && contentItem.TemplateAlias.IsNullOrWhiteSpace());
-            if (templateChanged)
-            {
-                var template = Services.FileService.GetTemplate(contentItem.TemplateAlias);
-                if (template == null && contentItem.TemplateAlias.IsNullOrWhiteSpace() == false)
-                {
-                    //ModelState.AddModelError("Template", "No template exists with the specified alias: " + contentItem.TemplateAlias);
-                    LogHelper.Warn<ContentController>("No template exists with the specified alias: " + contentItem.TemplateAlias);
-                }
-                else
-                {
-                    //NOTE: this could be null if there was a template and the posted template is null, this should remove the assigned template
-                    contentItem.PersistedContent.Template = template;
-                }
-            }
-
-            base.MapPropertyValues(contentItem);
-        }
+        
 
         /// <summary>
         /// Publishes a document with a given ID
@@ -374,23 +344,22 @@ namespace Umbraco.Web.Editors
                 {
                     case PublishStatusType.FailedPathNotPublished:
                         return Request.CreateValidationErrorResponse(
-                            ui.Text("publish", "contentPublishedFailedByParent",
-                                    string.Format("{0} ({1})", publishResult.Result.ContentItem.Name, publishResult.Result.ContentItem.Id),
-                                    Security.CurrentUser).Trim());
+                            Services.TextService.Localize("publish/contentPublishedFailedByParent",
+                                new[] {string.Format("{0} ({1})", publishResult.Result.ContentItem.Name, publishResult.Result.ContentItem.Id)}).Trim());
                     case PublishStatusType.FailedCancelledByEvent:
                         return Request.CreateValidationErrorResponse(
-                            ui.Text("speechBubbles", "contentPublishedFailedByEvent"));
+                            Services.TextService.Localize("speechBubbles/contentPublishedFailedByEvent"));
                     case PublishStatusType.FailedHasExpired:
                     case PublishStatusType.FailedAwaitingRelease:
                     case PublishStatusType.FailedIsTrashed:
                     case PublishStatusType.FailedContentInvalid:
                         return Request.CreateValidationErrorResponse(
-                           ui.Text("publish", "contentPublishedFailedInvalid",
-                                  new[]
-                                       {
-                                           string.Format("{0} ({1})", publishResult.Result.ContentItem.Name, publishResult.Result.ContentItem.Id),
-                                           string.Join(",", publishResult.Result.InvalidProperties.Select(x => x.Alias))
-                                       }, Security.CurrentUser));
+                            Services.TextService.Localize("publish/contentPublishedFailedInvalid",
+                                new[]
+                                {
+                                    string.Format("{0} ({1})", publishResult.Result.ContentItem.Name, publishResult.Result.ContentItem.Id),
+                                    string.Join(",", publishResult.Result.InvalidProperties.Select(x => x.Alias))
+                                }));
                 }
             }
 
@@ -535,13 +504,65 @@ namespace Umbraco.Web.Editors
 
             if (foundContent == null)
                 HandleContentNotFound(id);
-
-            Services.ContentService.UnPublish(foundContent);
+            
+            Services.ContentService.UnPublish(foundContent, Security.CurrentUser.Id);
             var content = Mapper.Map<IContent, ContentItemDisplay>(foundContent);
 
-            content.AddSuccessNotification(ui.Text("content", "unPublish"), ui.Text("speechBubbles", "contentUnpublished"));
+            content.AddSuccessNotification(Services.TextService.Localize("content/unPublish"), Services.TextService.Localize("speechBubbles/contentUnpublished"));
 
             return content;
+        }
+
+        /// <summary>
+        /// Checks if the user is currently in preview mode and if so will update the preview content for this item
+        /// </summary>
+        /// <param name="contentId"></param>
+        private void UpdatePreviewContext(int contentId)
+        {
+            var previewId = Request.GetPreviewCookieValue();
+            if (previewId.IsNullOrWhiteSpace()) return;
+            Guid id;
+            if (Guid.TryParse(previewId, out id))
+            {
+                var d = new Document(contentId);
+                var pc = new PreviewContent(UmbracoUser, id, false);
+                pc.PrepareDocument(UmbracoUser, d, true);
+                pc.SavePreviewSet();
+            }
+        }
+
+        /// <summary>
+        /// Maps the dto property values to the persisted model
+        /// </summary>
+        /// <param name="contentItem"></param>
+        private void MapPropertyValues(ContentItemSave contentItem)
+        {
+            UpdateName(contentItem);
+
+            //TODO: We need to support 'send to publish'
+
+            contentItem.PersistedContent.ExpireDate = contentItem.ExpireDate;
+            contentItem.PersistedContent.ReleaseDate = contentItem.ReleaseDate;
+            //only set the template if it didn't change
+            var templateChanged = (contentItem.PersistedContent.Template == null && contentItem.TemplateAlias.IsNullOrWhiteSpace() == false)
+                                  || (contentItem.PersistedContent.Template != null && contentItem.PersistedContent.Template.Alias != contentItem.TemplateAlias)
+                                  || (contentItem.PersistedContent.Template != null && contentItem.TemplateAlias.IsNullOrWhiteSpace());
+            if (templateChanged)
+            {
+                var template = Services.FileService.GetTemplate(contentItem.TemplateAlias);
+                if (template == null && contentItem.TemplateAlias.IsNullOrWhiteSpace() == false)
+                {
+                    //ModelState.AddModelError("Template", "No template exists with the specified alias: " + contentItem.TemplateAlias);
+                    LogHelper.Warn<ContentController>("No template exists with the specified alias: " + contentItem.TemplateAlias);
+                }
+                else
+                {
+                    //NOTE: this could be null if there was a template and the posted template is null, this should remove the assigned template
+                    contentItem.PersistedContent.Template = template;
+                }
+            }
+
+            base.MapPropertyValues(contentItem);
         }
 
         /// <summary>
@@ -568,7 +589,7 @@ namespace Umbraco.Web.Editors
                 if (toMove.ContentType.AllowedAsRoot == false)
                 {
                     throw new HttpResponseException(
-                        Request.CreateValidationErrorResponse(ui.Text("moveOrCopy", "notAllowedAtRoot", Security.CurrentUser)));
+                        Request.CreateValidationErrorResponse(Services.TextService.Localize("moveOrCopy/notAllowedAtRoot")));
                 }
             }
             else
@@ -584,14 +605,14 @@ namespace Umbraco.Web.Editors
                     .Any(x => x.Value == toMove.ContentType.Id) == false)
                 {
                     throw new HttpResponseException(
-                        Request.CreateValidationErrorResponse(ui.Text("moveOrCopy", "notAllowedByContentType", Security.CurrentUser)));
+                        Request.CreateValidationErrorResponse(Services.TextService.Localize("moveOrCopy/notAllowedByContentType")));
                 }
 
                 // Check on paths
                 if ((string.Format(",{0},", parent.Path)).IndexOf(string.Format(",{0},", toMove.Id), StringComparison.Ordinal) > -1)
                 {
                     throw new HttpResponseException(
-                        Request.CreateValidationErrorResponse(ui.Text("moveOrCopy", "notAllowedByPath", Security.CurrentUser)));
+                        Request.CreateValidationErrorResponse(Services.TextService.Localize("moveOrCopy/notAllowedByPath")));
                 }
             }
 
@@ -605,30 +626,23 @@ namespace Umbraco.Web.Editors
                 case PublishStatusType.Success:
                 case PublishStatusType.SuccessAlreadyPublished:
                     display.AddSuccessNotification(
-                        ui.Text("speechBubbles", "editContentPublishedHeader", UmbracoUser),
-                        ui.Text("speechBubbles", "editContentPublishedText", UmbracoUser));
+                        Services.TextService.Localize("speechBubbles/editContentPublishedHeader"),
+                        Services.TextService.Localize("speechBubbles/editContentPublishedText"));
                     break;
                 case PublishStatusType.FailedPathNotPublished:
                     display.AddWarningNotification(
-                        ui.Text("publish"),
-                        ui.Text("publish", "contentPublishedFailedByParent",
-                                string.Format("{0} ({1})", status.ContentItem.Name, status.ContentItem.Id),
-                                UmbracoUser).Trim());
+                        Services.TextService.Localize("publish"),
+                        Services.TextService.Localize("publish/contentPublishedFailedByParent",
+                            new[] {string.Format("{0} ({1})", status.ContentItem.Name, status.ContentItem.Id)}).Trim());
                     break;
                 case PublishStatusType.FailedCancelledByEvent:
-                    display.AddWarningNotification(
-                        ui.Text("publish"),
-                        ui.Text("speechBubbles", "contentPublishedFailedByEvent"));
+                    AddCancelMessage(display, "publish", "speechBubbles/contentPublishedFailedByEvent");
                     break;                
                 case PublishStatusType.FailedAwaitingRelease:
                     display.AddWarningNotification(
-                        ui.Text("publish"),
-                        ui.Text("publish", "contentPublishedFailedAwaitingRelease",
-                                new[]
-                                    {
-                                        string.Format("{0} ({1})", status.ContentItem.Name, status.ContentItem.Id)
-                                    },
-                                UmbracoUser).Trim());
+                        Services.TextService.Localize("publish"),
+                        Services.TextService.Localize("publish/contentPublishedFailedAwaitingRelease",
+                            new[] {string.Format("{0} ({1})", status.ContentItem.Name, status.ContentItem.Id)}).Trim());
                     break;
                 case PublishStatusType.FailedHasExpired:
                     //TODO: We should add proper error messaging for this!
@@ -636,14 +650,13 @@ namespace Umbraco.Web.Editors
                     //TODO: We should add proper error messaging for this!
                 case PublishStatusType.FailedContentInvalid:
                     display.AddWarningNotification(
-                        ui.Text("publish"),
-                        ui.Text("publish", "contentPublishedFailedInvalid",
-                                new[]
-                                    {
-                                        string.Format("{0} ({1})", status.ContentItem.Name, status.ContentItem.Id),
-                                        string.Join(",", status.InvalidProperties.Select(x => x.Alias))
-                                    },
-                                UmbracoUser).Trim());
+                        Services.TextService.Localize("publish"),
+                        Services.TextService.Localize("publish/contentPublishedFailedInvalid",
+                            new[]
+                            {
+                                string.Format("{0} ({1})", status.ContentItem.Name, status.ContentItem.Id),
+                                string.Join(",", status.InvalidProperties.Select(x => x.Alias))
+                            }).Trim());
                     break;
                 default:
                     throw new IndexOutOfRangeException();

@@ -13,6 +13,7 @@ using Umbraco.Core.Persistence.SqlSyntax;
 using Umbraco.Tests.TestHelpers;
 using umbraco.interfaces;
 using Umbraco.Core.Persistence;
+using Umbraco.Core.Profiling;
 using Umbraco.Core.Services;
 
 namespace Umbraco.Tests.BootManagers
@@ -35,7 +36,8 @@ namespace Umbraco.Tests.BootManagers
         {
             base.TearDown();
 
-            _testApp = null;            
+            _testApp = null;
+            ResolverCollection.ResetAll();
         }
 
      
@@ -46,7 +48,7 @@ namespace Umbraco.Tests.BootManagers
         {
             protected override IBootManager GetBootManager()
             {
-                return new TestBootManager(this);
+                return new TestBootManager(this, new ProfilingLogger(Mock.Of<ILogger>(), Mock.Of<IProfiler>()));
             }
         }
 
@@ -55,30 +57,32 @@ namespace Umbraco.Tests.BootManagers
         /// </summary>
         public class TestBootManager : CoreBootManager
         {
-            public TestBootManager(UmbracoApplicationBase umbracoApplication)
-                : base(umbracoApplication)
+            public TestBootManager(UmbracoApplicationBase umbracoApplication, ProfilingLogger logger)
+                : base(umbracoApplication, logger)
             {
             }
 
             /// <summary>
-            /// Creates and assigns the application context singleton
+            /// Creates and returns the application context singleton
             /// </summary>
             /// <param name="dbContext"></param>
             /// <param name="serviceContext"></param>
-            protected override void CreateApplicationContext(DatabaseContext dbContext, ServiceContext serviceContext)
+            protected override ApplicationContext CreateApplicationContext(DatabaseContext dbContext, ServiceContext serviceContext)
             {
-                base.CreateApplicationContext(dbContext, serviceContext);
+                var appContext = base.CreateApplicationContext(dbContext, serviceContext);
 
-                var dbContextMock = new Mock<DatabaseContext>(Mock.Of<IDatabaseFactory>(), Mock.Of<ILogger>(), Mock.Of<ISqlSyntaxProvider>(), "test");
+                var dbContextMock = new Mock<DatabaseContext>(Mock.Of<IDatabaseFactory>(), ProfilingLogger.Logger, Mock.Of<ISqlSyntaxProvider>(), "test");
                 dbContextMock.Setup(x => x.CanConnect).Returns(true);
-                ApplicationContext.DatabaseContext = dbContextMock.Object;
+                appContext.DatabaseContext = dbContextMock.Object;
+
+                return appContext;
             }
 
             protected override void InitializeApplicationEventsResolver()
             {
                 //create an empty resolver so we can add our own custom ones (don't type find)
                 ApplicationEventsResolver.Current = new ApplicationEventsResolver(
-                    new ActivatorServiceProvider(), Mock.Of<ILogger>(),
+                    new ActivatorServiceProvider(), ProfilingLogger.Logger,
                     new Type[]
                     {
                         typeof(LegacyStartupHandler),
@@ -89,6 +93,13 @@ namespace Umbraco.Tests.BootManagers
                     };
             }
             
+            protected override void InitializeLoggerResolver()
+            {                
+            }
+            
+            protected override void InitializeProfilerResolver()
+            {
+            }
         }
 
         /// <summary>

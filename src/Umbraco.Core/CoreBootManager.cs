@@ -7,6 +7,7 @@ using System.Web;
 using AutoMapper;
 using Umbraco.Core.Cache;
 using Umbraco.Core.Configuration;
+using Umbraco.Core.Events;
 using Umbraco.Core.Exceptions;
 using Umbraco.Core.IO;
 using Umbraco.Core.Logging;
@@ -41,15 +42,15 @@ namespace Umbraco.Core
     /// </remarks>
     public class CoreBootManager : IBootManager
     {
-        private ProfilingLogger _profilingLogger;
+        protected ProfilingLogger ProfilingLogger { get; private set; }
         private DisposableTimer _timer;
         private bool _isInitialized = false;
         private bool _isStarted = false;
         private bool _isComplete = false;
         private readonly IServiceProvider _serviceProvider = new ActivatorServiceProvider();
         private readonly UmbracoApplicationBase _umbracoApplication;
-        protected ApplicationContext ApplicationContext { get; set; }
-        protected CacheHelper ApplicationCache { get; set; }
+        protected ApplicationContext ApplicationContext { get; private set; }
+        protected CacheHelper ApplicationCache { get; private set; }
         protected PluginManager PluginManager { get; private set; }
 
         protected UmbracoApplicationBase UmbracoApplication
@@ -68,6 +69,14 @@ namespace Umbraco.Core
             _umbracoApplication = umbracoApplication;
         }
 
+        internal CoreBootManager(UmbracoApplicationBase umbracoApplication, ProfilingLogger logger)
+        {
+            if (umbracoApplication == null) throw new ArgumentNullException("umbracoApplication");
+            if (logger == null) throw new ArgumentNullException("logger");
+            _umbracoApplication = umbracoApplication;
+            ProfilingLogger = logger;
+        }
+
         public virtual IBootManager Initialize()
         {
             if (_isInitialized)
@@ -76,17 +85,17 @@ namespace Umbraco.Core
             InitializeLoggerResolver();
             InitializeProfilerResolver();
 
-            _profilingLogger = new ProfilingLogger(LoggerResolver.Current.Logger, ProfilerResolver.Current.Profiler);
+            ProfilingLogger = ProfilingLogger?? new ProfilingLogger(LoggerResolver.Current.Logger, ProfilerResolver.Current.Profiler);
 
-            _timer = _profilingLogger.TraceDuration<CoreBootManager>(
+            _timer = ProfilingLogger.TraceDuration<CoreBootManager>(
                 string.Format("Umbraco {0} application starting on {1}", UmbracoVersion.GetSemanticVersion().ToSemanticString(), NetworkHelper.MachineName),
                 "Umbraco application startup complete");
 
-            CreateApplicationCache();
+            ApplicationCache = CreateApplicationCache();
 
             //create and set the plugin manager (I'd much prefer to not use this singleton anymore but many things are using it unfortunately and
             // the way that it is setup, there must only ever be one per app so without IoC it would be hard to make this not a singleton)
-            PluginManager = new PluginManager(ServiceProvider, ApplicationCache.RuntimeCache, _profilingLogger);
+            PluginManager = new PluginManager(ServiceProvider, ApplicationCache.RuntimeCache, ProfilingLogger);
             PluginManager.Current = PluginManager;
 
             //Create the legacy prop-eds mapping
@@ -94,36 +103,30 @@ namespace Umbraco.Core
             LegacyParameterEditorAliasConverter.CreateMappingsForCoreEditors();
 
             //create database and service contexts for the app context
-            var dbFactory = new DefaultDatabaseFactory(GlobalSettings.UmbracoConnectionName, LoggerResolver.Current.Logger);
+            var dbFactory = new DefaultDatabaseFactory(GlobalSettings.UmbracoConnectionName, ProfilingLogger.Logger);
             Database.Mapper = new PetaPocoMapper();
 
             var dbContext = new DatabaseContext(
                 dbFactory,
-                LoggerResolver.Current.Logger,
-                SqlSyntaxProviders.CreateDefault(LoggerResolver.Current.Logger));
+                ProfilingLogger.Logger,
+                SqlSyntaxProviders.CreateDefault(ProfilingLogger.Logger));
 
             //initialize the DatabaseContext
             dbContext.Initialize();
-            
-            var serviceContext = new ServiceContext(
-                new RepositoryFactory(ApplicationCache, LoggerResolver.Current.Logger, dbContext.SqlSyntax, UmbracoConfig.For.UmbracoSettings()), 
-                new PetaPocoUnitOfWorkProvider(dbFactory),
-                new FileUnitOfWorkProvider(),
-                new PublishingStrategy(),
-                ApplicationCache,
-                LoggerResolver.Current.Logger);
 
-            CreateApplicationContext(dbContext, serviceContext);
+            //get the service context
+            var serviceContext = CreateServiceContext(dbContext, dbFactory);
+
+            //set property and singleton from response
+            ApplicationContext.Current = ApplicationContext = CreateApplicationContext(dbContext, serviceContext);
 
             InitializeApplicationEventsResolver();
 
             InitializeResolvers();
 
-            
-
             InitializeModelMappers();
 
-            using (_profilingLogger.DebugDuration<CoreBootManager>(
+            using (ProfilingLogger.DebugDuration<CoreBootManager>(
                 string.Format("Executing {0} IApplicationEventHandler.OnApplicationInitialized", ApplicationEventsResolver.Current.ApplicationEventHandlers.Count()),
                 "Finished executing IApplicationEventHandler.OnApplicationInitialized"))
 	        {
@@ -137,7 +140,7 @@ namespace Umbraco.Core
                         }
                         catch (Exception ex)
                         {
-                            _profilingLogger.Logger.Error<CoreBootManager>("An error occurred running OnApplicationInitialized for handler " + x.GetType(), ex);
+                            ProfilingLogger.Logger.Error<CoreBootManager>("An error occurred running OnApplicationInitialized for handler " + x.GetType(), ex);
                             throw;
                         }
                     });
@@ -149,28 +152,47 @@ namespace Umbraco.Core
         }
 
         /// <summary>
-        /// Creates and assigns the application context singleton
+        /// Creates and returns the service context for the app
         /// </summary>
         /// <param name="dbContext"></param>
-        /// <param name="serviceContext"></param>
-        protected virtual void CreateApplicationContext(DatabaseContext dbContext, ServiceContext serviceContext)
+        /// <param name="dbFactory"></param>
+        /// <returns></returns>
+        protected virtual ServiceContext CreateServiceContext(DatabaseContext dbContext, IDatabaseFactory dbFactory)
         {
-            //create the ApplicationContext
-            ApplicationContext = ApplicationContext.Current = new ApplicationContext(dbContext, serviceContext, ApplicationCache, _profilingLogger);
+            return new ServiceContext(
+                new RepositoryFactory(ApplicationCache, ProfilingLogger.Logger, dbContext.SqlSyntax, UmbracoConfig.For.UmbracoSettings()),
+                new PetaPocoUnitOfWorkProvider(dbFactory),
+                new FileUnitOfWorkProvider(),
+                new PublishingStrategy(),
+                ApplicationCache,
+                ProfilingLogger.Logger,
+                //default transient factory
+                new TransientMessagesFactory());
         }
 
         /// <summary>
-        /// Creates and assigns the ApplicationCache based on a new instance of System.Web.Caching.Cache
+        /// Creates and returns the application context for the app
         /// </summary>
-        protected virtual void CreateApplicationCache()
+        /// <param name="dbContext"></param>
+        /// <param name="serviceContext"></param>
+        protected virtual ApplicationContext CreateApplicationContext(DatabaseContext dbContext, ServiceContext serviceContext)
+        {
+            //create the ApplicationContext
+            return new ApplicationContext(dbContext, serviceContext, ApplicationCache, ProfilingLogger);
+        }
+
+        /// <summary>
+        /// Creates and returns the CacheHelper for the app
+        /// </summary>
+        protected virtual CacheHelper CreateApplicationCache()
         {
             var cacheHelper = new CacheHelper(
-                        new ObjectCacheRuntimeCacheProvider(),
-                        new StaticCacheProvider(),
+                new ObjectCacheRuntimeCacheProvider(),
+                new StaticCacheProvider(),
                 //we have no request based cache when not running in web-based context
-                        new NullCacheProvider());
+                new NullCacheProvider());
 
-            ApplicationCache = cacheHelper;
+            return cacheHelper;
         }
 
         /// <summary>
@@ -196,7 +218,7 @@ namespace Umbraco.Core
         /// </summary>
         protected virtual void InitializeLoggerResolver()
         {
-            LoggerResolver.Current = new LoggerResolver(Logger.CreateWithDefaultLog4NetConfiguration())
+            LoggerResolver.Current = new LoggerResolver(ProfilingLogger == null ? Logger.CreateWithDefaultLog4NetConfiguration() : ProfilingLogger.Logger)
             {
                 //This is another special resolver that needs to be resolvable before resolution is frozen
                 //since it is used for profiling the application startup
@@ -210,7 +232,7 @@ namespace Umbraco.Core
         protected virtual void InitializeProfilerResolver()
         {
             //By default we'll initialize the Log profiler (in the web project, we'll override with the web profiler)
-            ProfilerResolver.Current = new ProfilerResolver(new LogProfiler(LoggerResolver.Current.Logger))
+            ProfilerResolver.Current = new ProfilerResolver(ProfilingLogger == null ? new LogProfiler(LoggerResolver.Current.Logger) : ProfilingLogger.Profiler)
             {
                 //This is another special resolver that needs to be resolvable before resolution is frozen
                 //since it is used for profiling the application startup
@@ -231,7 +253,7 @@ namespace Umbraco.Core
             //... and set the special flag to let us resolve before frozen resolution
             ApplicationEventsResolver.Current = new ApplicationEventsResolver(
                 ServiceProvider, 
-                LoggerResolver.Current.Logger,
+                ProfilingLogger.Logger,
                 PluginManager.ResolveApplicationStartupHandlers())
             {
                 CanResolveBeforeFrozen = true
@@ -260,7 +282,7 @@ namespace Umbraco.Core
             if (_isStarted)
                 throw new InvalidOperationException("The boot manager has already been initialized");
 
-            using (_profilingLogger.DebugDuration<CoreBootManager>(
+            using (ProfilingLogger.DebugDuration<CoreBootManager>(
                 string.Format("Executing {0} IApplicationEventHandler.OnApplicationStarting", ApplicationEventsResolver.Current.ApplicationEventHandlers.Count()),
                 "Finished executing IApplicationEventHandler.OnApplicationStarting"))
 		    {
@@ -274,7 +296,7 @@ namespace Umbraco.Core
 		                }
 		                catch (Exception ex)
 		                {
-                            _profilingLogger.Logger.Error<CoreBootManager>("An error occurred running OnApplicationStarting for handler " + x.GetType(), ex);
+                            ProfilingLogger.Logger.Error<CoreBootManager>("An error occurred running OnApplicationStarting for handler " + x.GetType(), ex);
 		                    throw;
 		                }
 		            });
@@ -299,13 +321,19 @@ namespace Umbraco.Core
         {
             if (_isComplete)
                 throw new InvalidOperationException("The boot manager has already been completed");
-
+            
             FreezeResolution();
 
             //Here we need to make sure the db can be connected to
 		    EnsureDatabaseConnection();
 
-            using (_profilingLogger.DebugDuration<CoreBootManager>(
+
+            //This is a special case for the user service, we need to tell it if it's an upgrade, if so we need to ensure that
+            // exceptions are bubbled up if a user is attempted to be persisted during an upgrade (i.e. when they auth to login)
+            ((UserService) ApplicationContext.Services.UserService).IsUpgrading = true;
+
+
+            using (ProfilingLogger.DebugDuration<CoreBootManager>(
                 string.Format("Executing {0} IApplicationEventHandler.OnApplicationStarted", ApplicationEventsResolver.Current.ApplicationEventHandlers.Count()),
                 "Finished executing IApplicationEventHandler.OnApplicationStarted"))
             {
@@ -319,7 +347,7 @@ namespace Umbraco.Core
                         }
                         catch (Exception ex)
                         {
-                            _profilingLogger.Logger.Error<CoreBootManager>("An error occurred running OnApplicationStarted for handler " + x.GetType(), ex);
+                            ProfilingLogger.Logger.Error<CoreBootManager>("An error occurred running OnApplicationStarted for handler " + x.GetType(), ex);
                             throw;
                         }
                     }); 
@@ -386,12 +414,12 @@ namespace Umbraco.Core
                 ApplicationCache.RuntimeCache,
                 new ManifestParser(new DirectoryInfo(IOHelper.MapPath("~/App_Plugins")), ApplicationCache.RuntimeCache));
 
-            PropertyEditorResolver.Current = new PropertyEditorResolver(ServiceProvider, LoggerResolver.Current.Logger, () => PluginManager.ResolvePropertyEditors(), builder);
-            ParameterEditorResolver.Current = new ParameterEditorResolver(ServiceProvider, LoggerResolver.Current.Logger, () => PluginManager.ResolveParameterEditors(), builder);
+            PropertyEditorResolver.Current = new PropertyEditorResolver(ServiceProvider, ProfilingLogger.Logger, () => PluginManager.ResolvePropertyEditors(), builder);
+            ParameterEditorResolver.Current = new ParameterEditorResolver(ServiceProvider, ProfilingLogger.Logger, () => PluginManager.ResolveParameterEditors(), builder);
 
             //setup the validators resolver with our predefined validators
             ValidatorsResolver.Current = new ValidatorsResolver(
-                ServiceProvider, LoggerResolver.Current.Logger, new[]
+                ServiceProvider, ProfilingLogger.Logger, new[]
                 {
                     new Lazy<Type>(() => typeof (RequiredManifestValueValidator)),
                     new Lazy<Type>(() => typeof (RegexValidator)),
@@ -421,7 +449,7 @@ namespace Umbraco.Core
                 new DatabaseServerMessenger(ApplicationContext, true, new DatabaseServerMessengerOptions()));
 
             MappingResolver.Current = new MappingResolver(
-                ServiceProvider, LoggerResolver.Current.Logger,
+                ServiceProvider, ProfilingLogger.Logger,
                 () => PluginManager.ResolveAssignedMapperTypes());
 
            
@@ -429,38 +457,38 @@ namespace Umbraco.Core
             //    new RepositoryFactory(ApplicationCache));
 
             CacheRefreshersResolver.Current = new CacheRefreshersResolver(
-                ServiceProvider, LoggerResolver.Current.Logger,
+                ServiceProvider, ProfilingLogger.Logger,
                 () => PluginManager.ResolveCacheRefreshers());
 
             DataTypesResolver.Current = new DataTypesResolver(
-                ServiceProvider, LoggerResolver.Current.Logger,
+                ServiceProvider, ProfilingLogger.Logger,
                 () => PluginManager.ResolveDataTypes());
 
             MacroFieldEditorsResolver.Current = new MacroFieldEditorsResolver(
-                ServiceProvider, LoggerResolver.Current.Logger,
+                ServiceProvider, ProfilingLogger.Logger,
                 () => PluginManager.ResolveMacroRenderings());
 
             PackageActionsResolver.Current = new PackageActionsResolver(
-                ServiceProvider, LoggerResolver.Current.Logger,
+                ServiceProvider, ProfilingLogger.Logger,
                 () => PluginManager.ResolvePackageActions());
 
             ActionsResolver.Current = new ActionsResolver(
-                ServiceProvider, LoggerResolver.Current.Logger,
+                ServiceProvider, ProfilingLogger.Logger,
                 () => PluginManager.ResolveActions());
 
             //the database migration objects
             MigrationResolver.Current = new MigrationResolver(
-                LoggerResolver.Current.Logger,
+                ProfilingLogger.Logger,
                 () => PluginManager.ResolveTypes<IMigration>());
 
             // todo: remove once we drop IPropertyEditorValueConverter support.
             PropertyEditorValueConvertersResolver.Current = new PropertyEditorValueConvertersResolver(
-                ServiceProvider, LoggerResolver.Current.Logger,
+                ServiceProvider, ProfilingLogger.Logger,
                 PluginManager.ResolvePropertyEditorValueConverters());
 
             // need to filter out the ones we dont want!!
             PropertyValueConvertersResolver.Current = new PropertyValueConvertersResolver(
-                ServiceProvider, LoggerResolver.Current.Logger,
+                ServiceProvider, ProfilingLogger.Logger,
                 PluginManager.ResolveTypes<IPropertyValueConverter>());
 
             // use the new DefaultShortStringHelper
@@ -469,7 +497,7 @@ namespace Umbraco.Core
                 new DefaultShortStringHelper(UmbracoConfig.For.UmbracoSettings()).WithDefaultConfig());
 
             UrlSegmentProviderResolver.Current = new UrlSegmentProviderResolver(
-                ServiceProvider, LoggerResolver.Current.Logger,
+                ServiceProvider, ProfilingLogger.Logger,
                 typeof(DefaultUrlSegmentProvider));
 
             // by default, no factory is activated

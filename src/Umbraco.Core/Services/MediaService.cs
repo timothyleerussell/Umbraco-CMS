@@ -35,29 +35,9 @@ namespace Umbraco.Core.Services
         private readonly EntityXmlSerializer _entitySerializer = new EntityXmlSerializer();
         private readonly IDataTypeService _dataTypeService;
         private readonly IUserService _userService;
-
-        [Obsolete("Use the constructors that specify all dependencies instead")]
-        public MediaService(RepositoryFactory repositoryFactory)
-            : this(new PetaPocoUnitOfWorkProvider(), repositoryFactory)
-        {
-        }
-
-        [Obsolete("Use the constructors that specify all dependencies instead")]
-        public MediaService(IDatabaseUnitOfWorkProvider provider, RepositoryFactory repositoryFactory)
-            : base(provider, repositoryFactory, LoggerResolver.Current.Logger)
-        {
-            _dataTypeService = new DataTypeService(provider, repositoryFactory);
-            _userService = new UserService(provider, repositoryFactory);
-        }
-
-        [Obsolete("Use the constructors that specify all dependencies instead")]
-        public MediaService(IDatabaseUnitOfWorkProvider provider, RepositoryFactory repositoryFactory, IDataTypeService dataTypeService, IUserService userService)
-            : this(provider, repositoryFactory, LoggerResolver.Current.Logger, dataTypeService, userService)
-        {
-        }
-
-        public MediaService(IDatabaseUnitOfWorkProvider provider, RepositoryFactory repositoryFactory, ILogger logger, IDataTypeService dataTypeService, IUserService userService)
-            : base(provider, repositoryFactory, logger)
+        
+        public MediaService(IDatabaseUnitOfWorkProvider provider, RepositoryFactory repositoryFactory, ILogger logger, IEventMessagesFactory eventMessagesFactory, IDataTypeService dataTypeService, IUserService userService)
+            : base(provider, repositoryFactory, logger, eventMessagesFactory)
         {
             if (dataTypeService == null) throw new ArgumentNullException("dataTypeService");
             if (userService == null) throw new ArgumentNullException("userService");
@@ -293,6 +273,8 @@ namespace Umbraco.Core.Services
         /// <returns><see cref="IMedia"/></returns>
         public IEnumerable<IMedia> GetByIds(IEnumerable<int> ids)
         {
+            if (ids.Any() == false) return Enumerable.Empty<IMedia>();
+
             using (var repository = RepositoryFactory.CreateMediaRepository(UowProvider.GetUnitOfWork()))
             {
                 return repository.GetAll(ids.ToArray());
@@ -916,6 +898,8 @@ namespace Umbraco.Core.Services
             Audit(AuditType.Delete, "Delete Media performed by user", userId, media.Id);
         }
 
+        
+
         /// <summary>
         /// Permanently deletes versions from an <see cref="IMedia"/> object prior to a specific date.
         /// This method will never delete the latest version of a content item.
@@ -975,14 +959,20 @@ namespace Umbraco.Core.Services
         /// Saves a single <see cref="IMedia"/> object
         /// </summary>
         /// <param name="media">The <see cref="IMedia"/> to save</param>
-        /// <param name="userId">Id of the User saving the Content</param>
+        /// <param name="userId">Id of the User saving the Media</param>
         /// <param name="raiseEvents">Optional boolean indicating whether or not to raise events.</param>
-        public void Save(IMedia media, int userId = 0, bool raiseEvents = true)
+        public Attempt<OperationStatus> SaveWithStatus(IMedia media, int userId = 0, bool raiseEvents = true)
         {
             if (raiseEvents)
             {
-                if (Saving.IsRaisedEventCancelled(new SaveEventArgs<IMedia>(media), this))
-                    return;
+                if (Saving.IsRaisedEventCancelled(
+                    EventMessagesFactory.Get(),
+                    messages => new SaveEventArgs<IMedia>(media, messages), 
+                    this))
+                {
+                    return Attempt.Fail(OperationStatus.Cancelled);
+                }
+                    
             }
 
             var uow = UowProvider.GetUnitOfWork();
@@ -1001,25 +991,32 @@ namespace Umbraco.Core.Services
             }
 
             if (raiseEvents)
-                Saved.RaiseEvent(new SaveEventArgs<IMedia>(media, false), this);
+                Saved.RaiseEvent(EventMessagesFactory.Get(), messages => new SaveEventArgs<IMedia>(media, false, messages), this);
 
             Audit(AuditType.Save, "Save Media performed by user", userId, media.Id);
+
+            return Attempt.Succeed(OperationStatus.Success);
         }
 
         /// <summary>
         /// Saves a collection of <see cref="IMedia"/> objects
         /// </summary>
         /// <param name="medias">Collection of <see cref="IMedia"/> to save</param>
-        /// <param name="userId">Id of the User saving the Content</param>
+        /// <param name="userId">Id of the User saving the Media</param>
         /// <param name="raiseEvents">Optional boolean indicating whether or not to raise events.</param>
-        public void Save(IEnumerable<IMedia> medias, int userId = 0, bool raiseEvents = true)
+        public Attempt<OperationStatus> SaveWithStatus(IEnumerable<IMedia> medias, int userId = 0, bool raiseEvents = true)
         {
             var asArray = medias.ToArray();
 
             if (raiseEvents)
             {
-                if (Saving.IsRaisedEventCancelled(new SaveEventArgs<IMedia>(asArray), this))
-                    return;
+                if (Saving.IsRaisedEventCancelled(
+                    EventMessagesFactory.Get(), 
+                    messages => new SaveEventArgs<IMedia>(asArray, messages), 
+                    this))
+                {
+                    return Attempt.Fail(OperationStatus.Cancelled);
+                }
             }
 
             var uow = UowProvider.GetUnitOfWork();
@@ -1042,9 +1039,33 @@ namespace Umbraco.Core.Services
             }
 
             if (raiseEvents)
-                Saved.RaiseEvent(new SaveEventArgs<IMedia>(asArray, false), this);
+                Saved.RaiseEvent(EventMessagesFactory.Get(), messages => new SaveEventArgs<IMedia>(asArray, false, messages), this);
 
             Audit(AuditType.Save, "Save Media items performed by user", userId, -1);
+
+            return Attempt.Succeed(OperationStatus.Success);
+        }
+
+        /// <summary>
+        /// Saves a single <see cref="IMedia"/> object
+        /// </summary>
+        /// <param name="media">The <see cref="IMedia"/> to save</param>
+        /// <param name="userId">Id of the User saving the Content</param>
+        /// <param name="raiseEvents">Optional boolean indicating whether or not to raise events.</param>
+        public void Save(IMedia media, int userId = 0, bool raiseEvents = true)
+        {
+            SaveWithStatus(media, userId, raiseEvents);
+        }
+
+        /// <summary>
+        /// Saves a collection of <see cref="IMedia"/> objects
+        /// </summary>
+        /// <param name="medias">Collection of <see cref="IMedia"/> to save</param>
+        /// <param name="userId">Id of the User saving the Content</param>
+        /// <param name="raiseEvents">Optional boolean indicating whether or not to raise events.</param>
+        public void Save(IEnumerable<IMedia> medias, int userId = 0, bool raiseEvents = true)
+        {
+            SaveWithStatus(medias, userId, raiseEvents);
         }
 
         /// <summary>

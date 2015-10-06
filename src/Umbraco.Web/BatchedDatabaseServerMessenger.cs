@@ -5,7 +5,6 @@ using System.Web;
 using Newtonsoft.Json;
 using umbraco.interfaces;
 using Umbraco.Core;
-using Umbraco.Core.Logging;
 using Umbraco.Core.Models.Rdbms;
 using Umbraco.Core.Sync;
 using Umbraco.Web.Routing;
@@ -18,33 +17,14 @@ namespace Umbraco.Web
     /// <remarks>
     /// This binds to appropriate umbraco events in order to trigger the Boot(), Sync() & FlushBatch() calls
     /// </remarks>
-    public class BatchedDatabaseServerMessenger : Core.Sync.DatabaseServerMessenger
+    public class BatchedDatabaseServerMessenger : DatabaseServerMessenger
     {
         public BatchedDatabaseServerMessenger(ApplicationContext appContext, bool enableDistCalls, DatabaseServerMessengerOptions options)
             : base(appContext, enableDistCalls, options)
-        {
-            UmbracoApplicationBase.ApplicationStarted += Application_Started;
-            UmbracoModule.EndRequest += UmbracoModule_EndRequest;
-            UmbracoModule.RouteAttempt += UmbracoModule_RouteAttempt;
+        {   
         }
 
-        private void Application_Started(object sender, EventArgs eventArgs)
-        {
-            if (ApplicationContext.IsConfigured == false
-                || ApplicationContext.DatabaseContext.IsDatabaseConfigured == false
-                || ApplicationContext.DatabaseContext.CanConnect == false)
-            {
-
-                LogHelper.Warn<BatchedDatabaseServerMessenger>("The app is not configured or cannot connect to the database, this server cannot be initialized with "
-                                                               + typeof (BatchedDatabaseServerMessenger) + ", distributed calls will not be enabled for this server");
-            }
-            else
-            {
-                Boot();    
-            }
-        }
-
-        private void UmbracoModule_RouteAttempt(object sender, RoutableAttemptEventArgs e)
+        internal void UmbracoModule_RouteAttempt(object sender, RoutableAttemptEventArgs e)
         {
             switch (e.Outcome)
             {
@@ -67,7 +47,7 @@ namespace Umbraco.Web
             }
         }
 
-        private void UmbracoModule_EndRequest(object sender, EventArgs e)
+        internal void UmbracoModule_EndRequest(object sender, EventArgs e)
         {
             // will clear the batch - will remain in HttpContext though - that's ok
             FlushBatch();
@@ -137,5 +117,7 @@ namespace Umbraco.Web
             batch.Add(new RefreshInstructionEnvelope(servers, refresher,
                 RefreshInstruction.GetInstructions(refresher, messageType, ids, idType, json)));
         }
+
+        
     }
 }

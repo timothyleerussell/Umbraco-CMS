@@ -28,7 +28,6 @@ namespace Umbraco.Core.Services
     /// </summary>
     public class ContentService : RepositoryService, IContentService
     {
-
         private readonly IPublishingStrategy _publishingStrategy;
         private readonly EntityXmlSerializer _entitySerializer = new EntityXmlSerializer();
         private readonly IDataTypeService _dataTypeService;
@@ -38,41 +37,19 @@ namespace Umbraco.Core.Services
         //for example, the Move method needs to be locked but this calls the Save method which also needs to be locked.
         private static readonly ReaderWriterLockSlim Locker = new ReaderWriterLockSlim(LockRecursionPolicy.SupportsRecursion);
 
-        [Obsolete("Use the constructors that specify all dependencies instead")]
-        public ContentService()
-            : this(new RepositoryFactory(ApplicationContext.Current.ApplicationCache, LoggerResolver.Current.Logger, SqlSyntaxContext.SqlSyntaxProvider, UmbracoConfig.For.UmbracoSettings()))
-        { }
-
-        [Obsolete("Use the constructors that specify all dependencies instead")]
-        public ContentService(RepositoryFactory repositoryFactory)
-            : this(new PetaPocoUnitOfWorkProvider(LoggerResolver.Current.Logger), repositoryFactory, new PublishingStrategy())
-        { }
-
-        [Obsolete("Use the constructors that specify all dependencies instead")]
-        public ContentService(IDatabaseUnitOfWorkProvider provider)
-            : this(provider, new RepositoryFactory(ApplicationContext.Current.ApplicationCache, LoggerResolver.Current.Logger, SqlSyntaxContext.SqlSyntaxProvider, UmbracoConfig.For.UmbracoSettings()), new PublishingStrategy())
-        { }
-
-        [Obsolete("Use the constructors that specify all dependencies instead")]
-        public ContentService(IDatabaseUnitOfWorkProvider provider, RepositoryFactory repositoryFactory)
-            : this(provider, repositoryFactory, new PublishingStrategy())
-        { }
-
-        [Obsolete("Use the constructors that specify all dependencies instead")]
-        public ContentService(IDatabaseUnitOfWorkProvider provider, RepositoryFactory repositoryFactory, IPublishingStrategy publishingStrategy)
-            : base(provider, repositoryFactory, LoggerResolver.Current.Logger)
-        {
-            if (publishingStrategy == null) throw new ArgumentNullException("publishingStrategy");
-            _dataTypeService = new DataTypeService(UowProvider, RepositoryFactory);
-            _userService = new UserService(UowProvider, RepositoryFactory);
-        }
-
-        public ContentService(IDatabaseUnitOfWorkProvider provider, RepositoryFactory repositoryFactory, ILogger logger, IPublishingStrategy publishingStrategy, IDataTypeService dataTypeService, IUserService userService)
-            : base(provider, repositoryFactory, logger)
+        public ContentService(
+            IDatabaseUnitOfWorkProvider provider, 
+            RepositoryFactory repositoryFactory, 
+            ILogger logger,
+            IEventMessagesFactory eventMessagesFactory,
+            IPublishingStrategy publishingStrategy, 
+            IDataTypeService dataTypeService, 
+            IUserService userService)
+            : base(provider, repositoryFactory, logger, eventMessagesFactory)
         {
             if (publishingStrategy == null) throw new ArgumentNullException("publishingStrategy");
             if (dataTypeService == null) throw new ArgumentNullException("dataTypeService");
-            if (userService == null) throw new ArgumentNullException("userService");
+            if (userService == null) throw new ArgumentNullException("userService");         
             _publishingStrategy = publishingStrategy;
             _dataTypeService = dataTypeService;
             _userService = userService;
@@ -356,6 +333,8 @@ namespace Umbraco.Core.Services
         /// <returns><see cref="IContent"/></returns>
         public IEnumerable<IContent> GetByIds(IEnumerable<int> ids)
         {
+            if (ids.Any() == false) return Enumerable.Empty<IContent>();
+
             using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
             {
                 return repository.GetAll(ids.ToArray());
@@ -768,6 +747,8 @@ namespace Umbraco.Core.Services
             }
         }
 
+       
+
         /// <summary>
         /// Checks whether an <see cref="IContent"/> item has any children
         /// </summary>
@@ -961,29 +942,30 @@ namespace Umbraco.Core.Services
         /// <param name="content">The <see cref="IContent"/> to save</param>
         /// <param name="userId">Optional Id of the User saving the Content</param>
         /// <param name="raiseEvents">Optional boolean indicating whether or not to raise events.</param>
-        public void Save(IContent content, int userId = 0, bool raiseEvents = true)
+        public Attempt<OperationStatus> SaveWithStatus(IContent content, int userId = 0, bool raiseEvents = true)
         {
-            Save(content, true, userId, raiseEvents);
+            return Save(content, true, userId, raiseEvents);
         }
 
         /// <summary>
         /// Saves a collection of <see cref="IContent"/> objects.
-        /// </summary>
-        /// <remarks>
-        /// If the collection of content contains new objects that references eachother by Id or ParentId,
-        /// then use the overload Save method with a collection of Lazy <see cref="IContent"/>.
-        /// </remarks>
+        /// </summary>        
         /// <param name="contents">Collection of <see cref="IContent"/> to save</param>
         /// <param name="userId">Optional Id of the User saving the Content</param>
-        /// <param name="raiseEvents">Optional boolean indicating whether or not to raise events.</param>
-        public void Save(IEnumerable<IContent> contents, int userId = 0, bool raiseEvents = true)
+        /// <param name="raiseEvents">Optional boolean indicating whether or not to raise events.</param>        
+        public Attempt<OperationStatus> SaveWithStatus(IEnumerable<IContent> contents, int userId = 0, bool raiseEvents = true)
         {
             var asArray = contents.ToArray();
 
             if (raiseEvents)
             {
-                if (Saving.IsRaisedEventCancelled(new SaveEventArgs<IContent>(asArray), this))
-                    return;
+                if (Saving.IsRaisedEventCancelled(
+                    EventMessagesFactory.Get(),
+                    messages => new SaveEventArgs<IContent>(asArray, messages),
+                    this))
+                {
+                    return Attempt.Fail(OperationStatus.Cancelled);
+                }
             }
             using (new WriteLock(Locker))
             {
@@ -1022,10 +1004,38 @@ namespace Umbraco.Core.Services
                 }
 
                 if (raiseEvents)
-                    Saved.RaiseEvent(new SaveEventArgs<IContent>(asArray, false), this);
+                    Saved.RaiseEvent(EventMessagesFactory.Get(), messages => new SaveEventArgs<IContent>(asArray, false, messages), this);
 
                 Audit(AuditType.Save, "Bulk Save content performed by user", userId == -1 ? 0 : userId, Constants.System.Root);
+
+                return Attempt.Succeed(OperationStatus.Success);
             }
+        }
+
+        /// <summary>
+        /// Saves a single <see cref="IContent"/> object
+        /// </summary>
+        /// <param name="content">The <see cref="IContent"/> to save</param>
+        /// <param name="userId">Optional Id of the User saving the Content</param>
+        /// <param name="raiseEvents">Optional boolean indicating whether or not to raise events.</param>
+        public void Save(IContent content, int userId = 0, bool raiseEvents = true)
+        {
+            SaveWithStatus(content, userId, raiseEvents);
+        }
+
+        /// <summary>
+        /// Saves a collection of <see cref="IContent"/> objects.
+        /// </summary>
+        /// <remarks>
+        /// If the collection of content contains new objects that references eachother by Id or ParentId,
+        /// then use the overload Save method with a collection of Lazy <see cref="IContent"/>.
+        /// </remarks>
+        /// <param name="contents">Collection of <see cref="IContent"/> to save</param>
+        /// <param name="userId">Optional Id of the User saving the Content</param>
+        /// <param name="raiseEvents">Optional boolean indicating whether or not to raise events.</param>
+        public void Save(IEnumerable<IContent> contents, int userId = 0, bool raiseEvents = true)
+        {
+            SaveWithStatus(contents, userId, raiseEvents);
         }
 
         /// <summary>
@@ -1395,7 +1405,6 @@ namespace Umbraco.Core.Services
         /// <returns>True if sending publication was succesfull otherwise false</returns>
         public bool SendToPublication(IContent content, int userId = 0)
         {
-
             if (SendingToPublish.IsRaisedEventCancelled(new SendToPublishEventArgs<IContent>(content), this))
                 return false;
 
@@ -1405,8 +1414,7 @@ namespace Umbraco.Core.Services
             SentToPublish.RaiseEvent(new SendToPublishEventArgs<IContent>(content, false), this);
 
             Audit(AuditType.SendToPublish, "Send to Publish performed by user", content.WriterId, content.Id);
-
-            //TODO: will this ever be false??
+            
             return true;
         }
 
@@ -1800,7 +1808,9 @@ namespace Umbraco.Core.Services
         {
             if (raiseEvents)
             {
-                if (Saving.IsRaisedEventCancelled(new SaveEventArgs<IContent>(content), this))
+                if (Saving.IsRaisedEventCancelled(
+                    EventMessagesFactory.Get(),
+                    messages => new SaveEventArgs<IContent>(content, messages), this))
                 {
                     return Attempt.Fail(new PublishStatus(content, PublishStatusType.FailedCancelledByEvent));
                 }
@@ -1860,7 +1870,7 @@ namespace Umbraco.Core.Services
                 }
 
                 if (raiseEvents)
-                    Saved.RaiseEvent(new SaveEventArgs<IContent>(content, false), this);
+                    Saved.RaiseEvent(EventMessagesFactory.Get(), messages => new SaveEventArgs<IContent>(content, false, messages), this);
 
                 //Save xml to db and call following method to fire event through PublishingStrategy to update cache
                 if (published)
@@ -1889,12 +1899,17 @@ namespace Umbraco.Core.Services
         /// <param name="changeState">Boolean indicating whether or not to change the Published state upon saving</param>
         /// <param name="userId">Optional Id of the User saving the Content</param>
         /// <param name="raiseEvents">Optional boolean indicating whether or not to raise events.</param>
-        private void Save(IContent content, bool changeState, int userId = 0, bool raiseEvents = true)
+        private Attempt<OperationStatus> Save(IContent content, bool changeState, int userId = 0, bool raiseEvents = true)
         {
             if (raiseEvents)
             {
-                if (Saving.IsRaisedEventCancelled(new SaveEventArgs<IContent>(content), this))
-                    return;
+                  if (Saving.IsRaisedEventCancelled(
+                    EventMessagesFactory.Get(),
+                    messages => new SaveEventArgs<IContent>(content, messages),
+                    this))
+                {
+                    return Attempt.Fail(OperationStatus.Cancelled);
+                }              
             }
 
             using (new WriteLock(Locker))
@@ -1921,9 +1936,11 @@ namespace Umbraco.Core.Services
                 }
 
                 if (raiseEvents)
-                    Saved.RaiseEvent(new SaveEventArgs<IContent>(content, false), this);
+                    Saved.RaiseEvent(EventMessagesFactory.Get(), messages => new SaveEventArgs<IContent>(content, false, messages), this);
 
                 Audit(AuditType.Save, "Save Content performed by user", userId, content.Id);
+
+                return Attempt.Succeed(OperationStatus.Success);
             }
         }
 

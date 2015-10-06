@@ -248,7 +248,7 @@ namespace Umbraco.Web.Editors
             }
 
             //save the item
-            Services.MediaService.Save(contentItem.PersistedContent, (int)Security.CurrentUser.Id);
+            var saveStatus = Services.MediaService.SaveWithStatus(contentItem.PersistedContent, (int)Security.CurrentUser.Id);
 
             //return the updated model
             var display = Mapper.Map<IMedia, MediaItemDisplay>(contentItem.PersistedContent);
@@ -261,7 +261,17 @@ namespace Umbraco.Web.Editors
             {
                 case ContentSaveAction.Save:
                 case ContentSaveAction.SaveNew:
-                    display.AddSuccessNotification(ui.Text("speechBubbles", "editMediaSaved"), ui.Text("speechBubbles", "editMediaSavedText"));
+                    if (saveStatus.Success)
+                    {
+                        display.AddSuccessNotification(
+                            Services.TextService.Localize("speechBubbles/editMediaSaved"),
+                            Services.TextService.Localize("speechBubbles/editMediaSavedText"));
+                    }
+                    else
+                    {
+                        AddCancelMessage(display);
+                    }
+                    
                     break;                
             }
 
@@ -337,7 +347,7 @@ namespace Umbraco.Web.Editors
         {
             var mediaService = ApplicationContext.Services.MediaService;
             var f = mediaService.CreateMedia(folder.Name, folder.ParentId, Constants.Conventions.MediaTypes.Folder);
-            mediaService.Save(f);
+            mediaService.Save(f, Security.CurrentUser.Id);
 
             return Mapper.Map<IMedia, MediaItemDisplay>(f);
         }
@@ -404,7 +414,7 @@ namespace Umbraco.Web.Editors
                         mediaType = Constants.Conventions.MediaTypes.Image;
 
                     var mediaService = ApplicationContext.Services.MediaService;
-                    var f = mediaService.CreateMedia(fileName, parentId, mediaType);
+                    var f = mediaService.CreateMedia(fileName, parentId, mediaType, Security.CurrentUser.Id);
 
                     var fileInfo = new FileInfo(file.LocalFileName);
                     var fs = fileInfo.OpenReadWithRetry();
@@ -414,7 +424,7 @@ namespace Umbraco.Web.Editors
                         f.SetValue(Constants.Conventions.Media.File, fileName, fs);
                     }
 
-                    mediaService.Save(f);
+                    mediaService.Save(f, Security.CurrentUser.Id);
                 }
                 else
                 {
